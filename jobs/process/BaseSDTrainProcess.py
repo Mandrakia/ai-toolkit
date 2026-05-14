@@ -2059,7 +2059,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # make sure it is on the gpu
                 self.sd.unet.to(self.device_torch)
                 print_acc("Compiling model with torch.compile. The first forward will hang for a while using this. This is normal.")
-                self.sd.unet = torch.compile(self.sd.unet)
+                self.sd.unet = torch.compile(self.sd.unet, dynamic=True)
             except Exception as e:
                 print_acc(f"Failed to compile model: {e}")
                 print_acc("Continuing without compilation")
