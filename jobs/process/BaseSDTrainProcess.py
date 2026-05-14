@@ -2056,6 +2056,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # compile the model if needed (must be after LoRA/adapter injection AND accelerator.prepare)
         if self.model_config.compile:
             try:
+                # raise dynamo cache ceiling: multi-res buckets x DoP is_active toggle
+                # can blow past the default of 8 and cause recompile thrashing
+                torch._dynamo.config.cache_size_limit = 64
+                torch._dynamo.config.accumulated_cache_size_limit = 512
+                # log WHY each recompile happens so thrashing is visible in the log
+                torch._logging.set_logs(recompiles=True)
                 # make sure it is on the gpu
                 self.sd.unet.to(self.device_torch)
                 print_acc("Compiling model with torch.compile. The first forward will hang for a while using this. This is normal.")
