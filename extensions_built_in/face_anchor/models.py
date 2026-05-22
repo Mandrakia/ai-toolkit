@@ -13,13 +13,86 @@ import torch.nn.functional as F
 TAEF2_REPO = "madebyollin/taef2"
 TAEF2_FILE = "taef2.safetensors"
 
+# buffalo_l ONNX (SCRFD det_10g + ArcFace w600k_r50). Byte-identical to insightface's, but fetched
+# WITHOUT insightface/onnxruntime: from this HF mirror if not already on disk under ~/.insightface.
+BUFFALO_HF_REPO = "public-data/insightface"
 
-def load_arcface(onnx_path: str, device):
+
+def _convert_cache_dir():
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    d = os.path.join(base, "face_anchor", "onnx2torch")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def ensure_onnx_model(path, hf_filename):
+    """Local path to a buffalo_l onnx file. Use `path` if it exists (e.g. populated by insightface);
+    otherwise download the byte-identical file from HF (no insightface / onnxruntime) into the HF
+    cache and return that. Raises with a clear hint if both the local path and the download fail."""
+    local = os.path.expanduser(path)
+    if os.path.exists(local):
+        return local
+    try:
+        from huggingface_hub import hf_hub_download
+        p = hf_hub_download(BUFFALO_HF_REPO, f"models/buffalo_l/{hf_filename}")
+        print(f"[face_anchor] {hf_filename} not at {local}; fetched from HF {BUFFALO_HF_REPO} (cached)")
+        return p
+    except Exception as e:
+        raise FileNotFoundError(
+            f"face_anchor needs {hf_filename} (buffalo_l) and it is not at {local}; the HF fallback "
+            f"download failed: {e}. Place the buffalo_l ONNX models under ~/.insightface/models/buffalo_l/ "
+            f"or point det_onnx/arcface_onnx at them.")
+
+
+def _onnx2torch_version():
+    try:
+        from importlib.metadata import version
+        return version("onnx2torch")
+    except Exception:
+        import onnx2torch
+        return getattr(onnx2torch, "__version__", "x")
+
+
+def convert_onnx_cached(onnx_path: str, device):
+    """onnx2torch.convert with a disk cache of the converted GraphModule.
+
+    onnx2torch.convert reparses the ONNX graph every call (~1.9s for r50 ArcFace, ~1.3s for SCRFD);
+    torch.load of the pickled module is ~40x faster and bit-identical (validated 2026-05-22, grad
+    still flows). Cache key = onnx size:mtime + torch + onnx2torch versions, so a model/lib change
+    invalidates it. Any miss/load failure falls back to a fresh convert (and rewrites the cache).
+    Returns the module on `device`, eval, params frozen (input grad still flows for the train loss).
+    """
     import onnx2torch
-    model = onnx2torch.convert(onnx_path).to(device).eval()
+    onnx_path = os.path.expanduser(onnx_path)
+    try:
+        st = os.stat(onnx_path); sig = f"{st.st_size}_{int(st.st_mtime)}"
+    except Exception:
+        sig = "nosig"
+    tag = f"{os.path.basename(onnx_path)}.o2t-t{torch.__version__}-o{_onnx2torch_version()}-{sig}.pt"
+    tag = "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in tag)
+    cache = os.path.join(_convert_cache_dir(), tag)   # dedicated dir (onnx may live in the read-mostly HF cache)
+
+    model = None
+    if os.path.exists(cache):
+        try:
+            model = torch.load(cache, map_location="cpu", weights_only=False)
+        except Exception as e:
+            print(f"[face_anchor] converted-model cache unreadable ({os.path.basename(cache)}): {e}; reconverting")
+    if model is None:
+        model = onnx2torch.convert(onnx_path)
+        try:
+            torch.save(model, cache)
+        except Exception as e:
+            print(f"[face_anchor] could not cache converted model to {cache}: {e}")
+    model = model.to(device).eval()
     for p in model.parameters():
         p.requires_grad_(False)
-    return model  # fp32; feed via arcface_embed
+    return model
+
+
+def load_arcface(onnx_path: str, device):
+    # resolve (or HF-download) then convert-with-cache; fp32, feed via arcface_embed
+    return convert_onnx_cached(ensure_onnx_model(onnx_path, "w600k_r50.onnx"), device)
 
 
 def arcface_embed(model, img255: torch.Tensor) -> torch.Tensor:

@@ -38,23 +38,8 @@ loss += identity_loss_weight · mean(loss over kept samples)
 
 ## Enable it
 
-1. Build the cache once (offline, needs insightface — run in the GridLoraTester venv).
-   GLT prep: datasets curated; for a multi-folder character make a GLT **group** (its group
-   centroid lands in glt.db). Find a group id: `sqlite3 glt.db "SELECT id,name,paths_json FROM dataset_groups"`.
-
-   ```bash
-   # group (N folders = one identity, uses the GLT group centroid):
-   PYTHONPATH=/path/to/ai-toolkit /path/to/GridLoraTester/.venv/bin/python \
-     -m extensions_built_in.face_anchor.caching \
-     --glt-db /path/to/glt.db --group <id> --key <name> --out /abs/cache.pt \
-     --dirs /datasets/folderA /datasets/folderB ...
-   # folders (each folder = its own identity):
-   ... -m extensions_built_in.face_anchor.caching --glt-db /path/glt.db --out /abs/cache.pt --dirs /datasets/michel
-   ```
-   It detects faces, picks the target face (max cos to centroid), and stores per image
-   kps/bbox/yaw/clean_cos + the target **embedding** (needed for bias-correction) + the centroid.
-   Re-run when the datasets or centroid change. The training venv needs no insightface — only the .pt.
-2. In your training config, set the process `type: face_anchor_trainer` and add:
+Set the process `type: face_anchor_trainer` and add a `face_anchor:` block. The cache is built
+**automatically at the start of the run** — no offline preflight needed:
 
 ```yaml
 face_anchor:
@@ -63,14 +48,49 @@ face_anchor:
   tile_frac: 0.6
   min_cos: 0.2
   yaw_gate: 50.0
-  cache_path: "/abs/path/.face_anchor_cache.pt"
+  # auto_cache: true  (default) — see below; no cache_path needed
   # taef2_path: optional. If unset, madebyollin/taef2 auto-downloads to the HF cache (idempotent).
 ```
 
-Models needed at train time:
-- **taef2** — auto-downloads on first run (HF cache). Override with `taef2_path` only if you want a local copy.
-- **ArcFace `w600k_r50.onnx`** — placed under `~/.insightface/models/buffalo_l/` by insightface during
-  the cache preflight, so it's already there when you train. (No insightface needed in the training venv.)
+### Auto-cache (default) — built per-dataset + aggregated per-run
+
+On `hook_before_train_loop` (before the first step), the trainer mirrors the latent-cache pattern:
+
+1. **Per dataset** → writes a sidecar `<dataset_folder>/face_anchor.pt`, keyed by a **content
+   signature** of the image set (sorted realpath + `size:mtime` + `CACHE_VERSION`). On every run it
+   re-checks the signature: unchanged ⇒ reuse, changed (image added/removed/edited) ⇒ rebuild only
+   that dataset.
+2. **Per run** → aggregates the sidecars into `<output>/<run_name>/anchor_cache.pt`: unions all face
+   entries and computes **one global centroid** (every dataset in a run is treated as one identity;
+   reg datasets and video/audio datasets are skipped). Rebuilt only if any sidecar's signature, or
+   the set of datasets, changed. The anchor then loads this aggregate.
+
+Detection/embedding run **in-venv** via torch SCRFD + onnx2torch ArcFace — **no insightface, no
+onnxruntime, no pre-populated `~/.insightface`**. All model files auto-resolve:
+- **buffalo_l ONNX** (`det_10g.onnx` SCRFD + `w600k_r50.onnx` ArcFace): used from
+  `~/.insightface/models/buffalo_l/` if already there (e.g. insightface installed), else
+  auto-downloaded from HF `public-data/insightface` (byte-identical) into the HF cache. Override the
+  on-disk lookup with `det_onnx:` / `arcface_onnx:`.
+- The `onnx2torch.convert` (~3.2s) is cached to `~/.cache/face_anchor/onnx2torch/*.pt` (~36x faster
+  reload, keyed by torch+onnx2torch version + onnx size:mtime), so stop/start and later trainings skip it.
+- **taef2** auto-downloads on first run (HF cache); override with `taef2_path` for a local copy.
+
+### Legacy / hand-built cache
+
+Set `auto_cache: false` and point `cache_path:` at a `.pt` you built offline — e.g. to reuse a
+**GridLoraTester** group centroid (run in the GLT venv, which has insightface):
+
+```bash
+# group (N folders = one identity, uses the GLT group centroid):
+PYTHONPATH=/path/to/ai-toolkit /path/to/GridLoraTester/.venv/bin/python \
+  -m extensions_built_in.face_anchor.caching \
+  --glt-db /path/to/glt.db --group <id> --key <name> --out /abs/cache.pt \
+  --dirs /datasets/folderA /datasets/folderB ...
+# fully self-contained (no insightface), each dir its own identity unless --key groups them:
+... -m extensions_built_in.face_anchor.caching --independent --out /abs/cache.pt --dirs /datasets/michel
+```
+
+Then `cache_path: "/abs/cache.pt"` + `auto_cache: false`.
 
 Keep the anchor **eager / outside any `torch.compile` region** (data-dependent gating + skimage).
 

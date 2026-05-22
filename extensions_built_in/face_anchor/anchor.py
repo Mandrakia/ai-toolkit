@@ -54,11 +54,11 @@ class FaceAnchor:
             e = m.get("embedding")
             e_t = torch.tensor(np.asarray(e, np.float32), device=device) if e is not None else None
             if mode == "per_image" and e_t is not None:
-                tgt, clean = e_t, 1.0
+                tgt, clean = e_t, cfg.target_ceiling
             elif mode == "blend" and e_t is not None:
                 b = cfg.target_blend
                 tgt = F.normalize((b * e_t + (1.0 - b) * c).reshape(1, -1)).reshape(-1)
-                clean = 1.0
+                clean = cfg.target_ceiling
             else:  # centroid (or per_image/blend with no GT embedding available)
                 tgt = c
                 clean = self._cos(e_t, c) if (cfg.clean_cos_target and e_t is not None) else 1.0
@@ -104,6 +104,10 @@ class FaceAnchor:
                 continue
             if abs(meta["yaw"]) > cfg.yaw_gate:                 # strong profile: alignment unreliable
                 continue
+            # gate on t01 as the noise fraction (sigma). Exact for sigmoid/weighted/linear; NOT
+            # corrected for the resolution-dependent shift modes (shift/flux_shift/lumina2_shift) —
+            # there t01 is the shifted sigma, so this cut sits at a different schedule position per
+            # resolution bucket. See FaceAnchorConfig.min_t.
             if tr[i] < cfg.min_t or tr[i] > cfg.max_t:
                 continue
             ref = self._target.get(path)                        # mode-aware target (per_image/centroid/blend)

@@ -8,6 +8,7 @@ Usage: set the process type to `face_anchor_trainer` and add a `face_anchor:` bl
 The anchor is computed eagerly and added to the diffusion loss before the single backward —
 keep it OUTSIDE any torch.compile region (data-dependent gating + skimage).
 """
+import os
 import torch
 from collections import OrderedDict
 from typing import Union
@@ -37,6 +38,53 @@ class FaceAnchorTrainer(DiffusionTrainer):
             print(f"\n[face_anchor] active: weight={self.face_anchor_config.identity_loss_weight} "
                   f"tile_frac={self.face_anchor_config.tile_frac} yaw_gate={self.face_anchor_config.yaw_gate}")
         return self._face_anchor
+
+    def hook_before_train_loop(self):
+        # datasets + dataloader exist by now (built in run() right before this hook); the model is
+        # loaded but training hasn't started. Build/validate the anchor cache here, before _anchor()
+        # loads it on the first calculate_loss.
+        super().hook_before_train_loop()
+        cfg = self.face_anchor_config
+        if cfg.active and cfg.auto_cache:
+            self._prepare_anchor_cache()
+
+    def _prepare_anchor_cache(self):
+        """Build per-dataset sidecars (<dataset>/<cache_filename>) + aggregate them into
+        <save_root>/anchor_cache.pt, then point the anchor at the aggregate. Each level rebuilds only
+        if its data changed (signature check). All datasets in a run = one identity (one centroid)."""
+        from toolkit.data_loader import get_dataloader_datasets
+        from . import caching
+        cfg = self.face_anchor_config
+        if self.data_loader is None:
+            print("[face_anchor] no data_loader; auto_cache skipped, using cache_path as-is")
+            return
+        specs = []   # (key, sidecar_dir, image_paths)
+        for ds in get_dataloader_datasets(self.data_loader):
+            if getattr(ds, "is_video", False) or getattr(ds, "is_audio_model", False):
+                continue  # the anchor is image-only
+            paths = sorted({fi.path for fi in ds.file_list})  # dedupe num_repeats
+            if not paths:
+                continue
+            base = ds.dataset_path
+            sidecar_dir = base if os.path.isdir(base) else os.path.dirname(base)
+            key = os.path.basename(os.path.normpath(sidecar_dir)) or "dataset"
+            specs.append((key, sidecar_dir, paths))
+        if not specs:
+            print("[face_anchor] no image datasets found; auto_cache skipped")
+            return
+
+        agg_path = os.path.join(self.save_root, "anchor_cache.pt")
+        # main process builds/writes; others wait then read the finished files from disk
+        with self.accelerator.main_process_first():
+            if self.accelerator.is_main_process:
+                caching.prepare_run_cache(
+                    specs, agg_path,
+                    device=self.device_torch,
+                    arcface_onnx=cfg.arcface_onnx, det_onnx=cfg.det_onnx,
+                    cache_filename=cfg.cache_filename, global_key=cfg.identity_key,
+                )
+        cfg.cache_path = agg_path
+        print(f"[face_anchor] anchor cache: {agg_path}")
 
     def _to_vae_latent(self, x0):
         """The flux2-klein custom VAE packs+normalizes the latent to 128ch (ps=2x2 + BatchNorm),
