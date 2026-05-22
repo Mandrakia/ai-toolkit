@@ -1,55 +1,71 @@
 # Face Identity Anchor
 
-A differentiable **ArcFace identity loss** added alongside the diffusion loss, to keep a
-character LoRA recognizable. Inspired by `ai-toolkit-perceptual` (BuffaloBuffalo), adapted
-for **Flux-2 Klein** and for reusing a precomputed identity **centroid** (e.g. from GridLoraTester).
+A differentiable **ArcFace identity loss** for **Flux-2 Klein** character LoRAs, added alongside the
+diffusion loss so the character converges to a recognizable identity faster. Inspired by the perceptual
+identity loss in `ai-toolkit-perceptual` (BuffaloBuffalo). The identity cache is built **automatically
+per run** (see below); by default each generated face is pushed toward **its own** real embedding
+(`identity_target: per_image`), not a shared centroid.
 
-Per step, for each face-bearing sample:
+Per step, for each kept face-bearing sample (kept = `sigma ∈ [min_t, max_t]` and `|yaw| < yaw_gate`):
 
 ```
-noise_pred ──► x0 = noisy_latents − sigma·noise_pred      (flow-matching clean latent, grad on)
+noise_pred ──► x0 = noisy_latents − sigma·noise_pred        (flow-matching clean latent, grad on)
             ──► crop the face's fixed-size latent tile (tile_frac of the frame)
-            ──► taef2 decode (tiny VAE)  ── grad ──►  RGB tile
-            ──► landmark-aligned warp to 112×112  (estimate_norm + grid_sample)
+            ──► taef2 decode (tiny VAE)  ──►  RGB tile  ──► landmark-aligned 112 warp
             ──► ArcFace (onnx2torch w600k_r50, frozen)  ──►  512-d embedding
-            ──► loss = clamp(1 − cos(emb, centroid)/clean_cos, 0) · t_ratio
+            ──► cos(emb, target)        target = this image's own embedding (per_image, default)
+            ──► loss = clamp(1 − cos/target_ceiling, 0) · sigma   (pushed only where cos > min_cos)
 loss += identity_loss_weight · mean(loss over kept samples)
 ```
 
-## Why these choices (all smoke-tested 2026-05-21)
+## Why these choices
 
-- **Differentiable ArcFace via onnx2torch** of insightface `w600k_r50.onnx`: numerically identical
-  to insightface (cos 1.0), ~18 ms / 0.6 GB for bs8 fwd+bwd. Same weights as a GLT centroid → the
-  centroid is reusable verbatim.
+- **Differentiable ArcFace via onnx2torch** of insightface `w600k_r50.onnx`: numerically identical to
+  insightface (cos 1.0) and cheap (~18 ms / 0.6 GB for a bs8 fwd+bwd). Frozen.
+- **Target = `per_image` (default)**: push each face toward THAT image's own real embedding, not a
+  fictional dataset-average centroid (which is nobody, and an impossible target for off-frontal shots).
+  `centroid` / `blend` modes exist for the GLT-style shared-centroid case.
+- **`target_ceiling` (0.9)**: cos=1.0 is unreachable (taef2 + warp + bias-correction all lower it), so
+  targeting it over-corrects toward a point the pipeline can't reach — cap the loss at the achievable
+  plateau.
+- **`min_t` / `max_t` window (default 0.5–0.75) — the lighting lever**: ArcFace is illumination-invariant,
+  so when the anchor fires at low noise (where the model renders shading) it teaches the LoRA to make
+  faces flat — no shadows, no play of light. `min_t` keeps it in the high-noise *geometry* regime; `max_t`
+  drops the top noise band where `x0_pred` is unrecognizable mush (no usable identity). The recognizable/
+  shaded zone is **framing-driven** (face area ÷ photo area, not pose), so the defaults are set to the
+  tightest-framed worst case — run `probe_min_t.py` to re-measure for a dataset. NB: these are `sigma`
+  cuts and assume **no resolution-dependent timestep shift** — exact for `timestep_type`
+  sigmoid/weighted/linear, but NOT for shift/flux_shift/lumina2_shift.
+- **`bias_correction` (default on)**: subtract the mean ArcFace embedding of random-noise crops from both
+  sides before the cosine, so non-faces score ~0 instead of ArcFace's ~0.5 floor (cleaner gradient +
+  meaningful `min_cos`). Uses the GT embeddings the cache stores.
 - **Landmark alignment (not bbox crop)**: a `grid_sample` warp from insightface's `estimate_norm`
-  reproduces `norm_crop` to cos 0.9998+, profile included. Roll is confirmed irrelevant once aligned
-  (partial corr +0.08); only out-of-plane yaw/pitch remain. Alignment avoids double-penalizing
-  off-frontal faces.
-- **taef2 tiny VAE** (`madebyollin/taef2`, 32-ch): loads into `diffusers.AutoencoderTiny(latent_channels=32)`
-  (decoder exact, missing=0). Preserves identity (roundtrip cos ≈ full VAE within ~0.02-0.04) at
-  ~13× lower cost than the full Flux-2 VAE (which OOMs full-frame at bs>1).
-- **Fixed-size face tile (`tile_frac`)**: latent **resize** destroys identity (don't), but a fixed
-  *window* (constant fraction of the frame, no resize) preserves it. `tile_frac=0.6` covers **99.3%**
-  of the real face-size distribution (GLT: median face = 28% of frame, p95 = 51%). Fixed shape ⇒
-  predictable VRAM, no step-30 OOM, compile-friendly. ~0.65 GB/sample at 1024 (bs8 ≈ 5 GB).
-- **No formula for pose**: per-image `clean_cos` is the exact pose-fair target (a fitted
-  deltaSim=f(yaw,pitch) is not transferable across characters — R² 0.07→0.81). Plus a hard
-  `yaw_gate` (~50°) skip for strong profiles, where alignment is unreliable and data is sparse.
+  reproduces `norm_crop` to cos 0.9998+; roll is irrelevant once aligned, only out-of-plane yaw/pitch
+  remain. Plus a hard `yaw_gate` (~50°) skip for strong profiles. Avoids double-penalizing off-frontal faces.
+- **taef2 tiny VAE for the per-step decode**: the full Flux-2 VAE OOMs full-frame at bs>1, so the loss
+  decodes a fixed face tile with `madebyollin/taef2` (`AutoencoderTiny(latent_channels=32)`) — cheap and
+  identity-faithful (ArcFace is color-robust). Its **colorimetry is only approximate**, which is why the
+  `probe_min_t` diagnostic decodes with the real VAE for faithful color.
+- **Fixed-size face tile (`tile_frac=0.6`)**: latent *resize* destroys identity, but a fixed *window*
+  (constant fraction of the frame, no resize) preserves it. 0.6 covers ~99% of the real face-size
+  distribution. Fixed shape ⇒ predictable VRAM, no step-30 OOM, compile-friendly.
 
 ## Enable it
 
-Set the process `type: face_anchor_trainer` and add a `face_anchor:` block. The cache is built
-**automatically at the start of the run** — no offline preflight needed:
+Set the process `type: face_anchor_trainer`. The defaults are tuned so an **empty (or absent)
+`face_anchor:` block already runs it well** — the cache builds automatically at the start of the run
+(no offline preflight). Override only what you need:
 
 ```yaml
 face_anchor:
-  enabled: true
-  identity_loss_weight: 0.1
-  tile_frac: 0.6
-  min_cos: 0.2
-  yaw_gate: 50.0
-  # auto_cache: true  (default) — see below; no cache_path needed
-  # taef2_path: optional. If unset, madebyollin/taef2 auto-downloads to the HF cache (idempotent).
+  enabled: true                # default true once you select face_anchor_trainer (0-weight or false disables)
+  identity_loss_weight: 0.1    # default 0.1
+  # defaults, shown for reference — usually leave them:
+  #   identity_target: per_image | target_ceiling: 0.9 | bias_correction: true
+  #   min_t: 0.5 | max_t: 0.75  (the lighting window; framing-specific — see probe_min_t.py)
+  #   tile_frac: 0.6 | min_cos: 0.2 | yaw_gate: 50
+  #   auto_cache: true  (builds the cache; no cache_path needed)
+  #   taef2_path: null  (auto-downloads madebyollin/taef2 to the HF cache)
 ```
 
 ### Auto-cache (default) — built per-dataset + aggregated per-run
@@ -94,13 +110,16 @@ Then `cache_path: "/abs/cache.pt"` + `auto_cache: false`.
 
 Keep the anchor **eager / outside any `torch.compile` region** (data-dependent gating + skimage).
 
-## TODO (skeleton → production)
+## TODO / next
 
+- **Adaptive per-image `min_t`/`max_t`**: the window is framing-driven, so a fixed cut (set to the
+  tightest-framed worst case) under-uses the anchor on wide/medium-framed shots — they fire mostly in
+  their own mush band. Make the threshold `f(face_frac)` (face area ÷ photo area, already in the cache
+  via `bbox_norm`), derivable from the flow-matching shift formula (face token count). Keeps the anchor
+  uniform across a deliberately-diverse dataset without curating it.
+- **Validate on a real run**: confirm the anchor improves held-out identity without flattening lighting
+  (now that `min_t`/`max_t` are tuned); tune `identity_loss_weight`.
 - **Cache crop offset**: train-side kps mapping assumes aspect-preserving resize only. If the data
-  pipeline center-crops, store and apply the crop transform (FileItemDTO) — otherwise the window is
-  slightly off on cropped images.
-- **Logging**: surface `id_n / id_cos / id_B` into the training log + progress bar.
-- **ArcFace bias correction** (subtract mean noise-crop embedding) for cleaner non-face scores.
-- **Validate on a real run**: confirm the anchor improves held-out identity without burning in / hurting
-  pose generalization; tune `identity_loss_weight` (start 0.01–0.1).
+  pipeline center-crops, store and apply the crop transform (FileItemDTO).
+- **Logging**: surface `id_n / id_cos / id_B` into the training log + progress bar (currently console only).
 - Optional levers: skip decode for reg/no-face samples; grad-checkpoint the tiny decode; sub-batch the anchor.
